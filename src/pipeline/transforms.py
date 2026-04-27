@@ -1,121 +1,68 @@
-"""Transforms for M-106 Merlin abdominal-CT findings pipeline.
+"""Rendering primitives for M-106 JIGSAWS action-segmentation pipeline.
 
-Pipeline = abdominal CT volume + study metadata → axial sweep video (+ side panel).
-
-Rendering contract:
-
-    frame = [ CT_axial_slice (square)  ||  Clinical / acquisition panel ]
-
-    first_video        = axial sweep through central abdomen, NO highlight.
-    last_video         = same sweep with warm overlay on parenchymal (organ)
-                         HU range and a reveal banner showing study metadata.
-    ground_truth_video = same as last_video.
-
-Merlin ships abdominal CT volumes plus per-study acquisition metadata
-(age/gender/race/contrast/manufacturer/phase). It does NOT ship per-voxel
-labels or radiology reports in this bundle, so the "annotation" is a
-visual organ-window highlight (informative for the model) and the side
-panel surfaces patient + scanner context.
+Each frame = [ action banner (color-coded) | surgical video frame (square) ]
+stacked vertically. A consistent palette assigns a distinct color per action
+label so transitions between gestures are visually obvious in the output mp4.
 """
 from __future__ import annotations
 
+import colorsys
+import hashlib
 import subprocess
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  CT windowing
+#  Action -> color palette (deterministic, distinct, contrasting)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def window_slice(hu: np.ndarray, wl: int, ww: int) -> np.ndarray:
-    """Apply HU window → uint8 grayscale."""
-    vmin = wl - ww / 2.0
-    vmax = wl + ww / 2.0
-    img = np.clip((hu.astype(np.float32) - vmin) / (vmax - vmin) * 255.0, 0, 255)
-    return img.astype(np.uint8)
+# Hand-picked HSL hues evenly spaced on the wheel (avoids reds-only collisions).
+_BASE_PALETTE: List[Tuple[int, int, int]] = [
+    (255, 196,  37),   # G1  amber/yellow
+    ( 47, 134, 255),   # G2  azure blue
+    ( 56, 200, 110),   # G3  emerald green
+    (255, 105, 180),   # G4  hot pink
+    (170,  90, 220),   # G5  purple
+    (255, 130,  60),   # G6  orange
+    ( 80, 220, 220),   # G7  cyan
+    (220,  50,  50),   # G8  red
+    (130, 200,  60),   # G9  lime
+    (240, 200, 110),   # G10 light gold
+    ( 50, 160, 200),   # G11 teal
+    (200,  90, 140),   # G12 magenta
+    (160, 130,  90),   # G13 taupe
+    (110, 200, 170),   # G14 mint
+    (220,  60, 100),   # G15 rose-red
+]
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  Axial-sweep slice selection
-# ──────────────────────────────────────────────────────────────────────────────
+def build_action_palette(actions: List[str]) -> Dict[str, Tuple[int, int, int]]:
+    """Assign a deterministic color to each unique action label.
 
-def pick_sweep_indices(num_slices: int, num_frames: int) -> List[int]:
-    """Pick N evenly-spaced slices from the central ~60% of the volume.
-
-    For abdominal CT this hits liver / spleen / kidneys / pancreas region.
+    First N labels go to the curated palette; if there are more, additional
+    colors are derived deterministically from a hash of the label so the
+    same label always renders the same color even across episodes.
     """
-    if num_slices <= 0:
-        return []
-    lo = int(num_slices * 0.20)
-    hi = max(lo + 1, int(num_slices * 0.80))
-    hi = min(hi, num_slices)
-    if hi - lo < num_frames:
-        lo, hi = 0, num_slices
-    idxs = np.linspace(lo, hi - 1, num=min(num_frames, hi - lo)).round().astype(int)
-    seen = set()
-    out: List[int] = []
-    for i in idxs:
-        ii = int(i)
-        if ii in seen:
+    palette: Dict[str, Tuple[int, int, int]] = {}
+    for i, act in enumerate(actions):
+        if act in palette:
             continue
-        seen.add(ii)
-        out.append(ii)
-    return out
+        if i < len(_BASE_PALETTE):
+            palette[act] = _BASE_PALETTE[i]
+        else:
+            h = int(hashlib.md5(act.encode("utf-8")).hexdigest()[:6], 16)
+            hue = (h % 360) / 360.0
+            r, g, b = colorsys.hls_to_rgb(hue, 0.55, 0.65)
+            palette[act] = (int(r * 255), int(g * 255), int(b * 255))
+    return palette
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  Organ-region heuristic mask (Merlin has no per-voxel labels)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def pe_heuristic_mask(hu_slice: np.ndarray) -> np.ndarray:
-    """Heuristic abdominal-organ highlight: parenchymal HU (~+30..+80) inside
-    the central abdomen ROI. Returns a bool mask.
-
-    Function name kept as ``pe_heuristic_mask`` for code-shape compatibility
-    with the M-100 sister pipeline; semantics here are "organ parenchyma".
-    """
-    h, w = hu_slice.shape
-    yy, xx = np.ogrid[:h, :w]
-    cy, cx = h // 2, w // 2
-    radius = min(h, w) * 0.38
-    roi = ((yy - cy) ** 2 + (xx - cx) ** 2) <= (radius ** 2)
-    # Soft-tissue parenchyma window (liver, spleen, kidney, pancreas).
-    parenchyma = (hu_slice >= 30) & (hu_slice <= 80)
-    return roi & parenchyma
-
-
-def colorize_ct_slice(
-    hu: np.ndarray,
-    wl: int,
-    ww: int,
-    pe_mask: Optional[np.ndarray] = None,
-    alpha: float = 0.35,
-) -> np.ndarray:
-    """Render CT slice as RGB; warm-tint parenchymal organ regions (optional)."""
-    gray = window_slice(hu, wl, ww)
-    rgb = np.stack([gray, gray, gray], axis=-1).astype(np.uint8)
-
-    # Faint cool tint on vasculature (>+90 HU contrast-enhanced vessels).
-    vessel_mask = (hu >= 90) & (hu < 200)
-    if vessel_mask.any():
-        cool = np.array([60, 140, 230], dtype=np.float32)
-        base = rgb[vessel_mask].astype(np.float32)
-        rgb[vessel_mask] = (base * 0.85 + cool * 0.15).astype(np.uint8)
-
-    if pe_mask is not None and pe_mask.any():
-        warm = np.array([255, 140, 30], dtype=np.float32)  # amber/organ overlay
-        base = rgb[pe_mask].astype(np.float32)
-        rgb[pe_mask] = (base * (1 - alpha) + warm * alpha).astype(np.uint8)
-
-    return rgb
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  Side panel (study + acquisition metadata)
+#  Fonts
 # ──────────────────────────────────────────────────────────────────────────────
 
 _FONT_CACHE: dict = {}
@@ -125,8 +72,9 @@ def _load_font(size: int) -> ImageFont.ImageFont:
     if size in _FONT_CACHE:
         return _FONT_CACHE[size]
     candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
         "/System/Library/Fonts/Supplemental/Arial.ttf",
         "/Library/Fonts/Arial.ttf",
     ]
@@ -143,131 +91,145 @@ def _load_font(size: int) -> ImageFont.ImageFont:
     return font
 
 
-def _fmt_age(age: str) -> str:
-    if not age:
-        return "?"
-    try:
-        return f"{float(age):.0f} yr"
-    except (TypeError, ValueError):
-        return age
+# ──────────────────────────────────────────────────────────────────────────────
+#  Frame composition
+# ──────────────────────────────────────────────────────────────────────────────
+
+def resize_square(rgb: np.ndarray, size: int) -> np.ndarray:
+    """Resize an RGB frame to size x size (LANCZOS).
+
+    NOTE: We do *not* preserve aspect by padding because all JIGSAWS clips
+    share the same camera aspect and a consistent square is what the website
+    expects. We also intentionally do NOT horizontally flip (asymmetric
+    robotic instruments — left vs right tool roles must be preserved).
+    """
+    pil = Image.fromarray(rgb)
+    pil = pil.resize((size, size), Image.Resampling.LANCZOS)
+    return np.array(pil)
 
 
-def _fmt_phase(phase: str) -> str:
-    if not phase:
-        return "—"
-    return phase.replace("_", " ")
-
-
-def _fmt_contrast(contrast: str) -> str:
-    if not contrast:
-        return "—"
-    s = contrast.strip().lower()
-    if s in ("true", "1", "yes", "y"):
-        return "Contrast-enhanced"
-    if s in ("false", "0", "no", "n"):
-        return "Non-contrast"
-    return contrast
-
-
-def render_ehr_panel(
-    raw: dict,
+def render_action_banner(
     width: int,
     height: int,
-    title: str,
-    reveal: bool = False,
+    action: str,
+    color: Tuple[int, int, int],
+    progress: float,
+    transition: bool,
 ) -> np.ndarray:
-    """Render a clinical / acquisition side panel (dark bg, white text)."""
-    img = Image.new("RGB", (width, height), (18, 20, 26))
+    """Render a colored action banner.
+
+    Layout::
+
+        [ ████████████░░░░░░░ ]   <- progress bar (top edge, 4 px)
+        ACTION TEXT (white, bold, centered)
+    """
+    img = Image.new("RGB", (width, height), color)
     draw = ImageDraw.Draw(img)
 
-    font_title = _load_font(20)
-    font_label = _load_font(14)
-    font_value = _load_font(14)
-    font_small = _load_font(12)
+    # Top progress bar (light overlay over banner color).
+    bar_h = 4
+    bar_w = max(1, int(width * max(0.0, min(1.0, progress))))
+    draw.rectangle((0, 0, bar_w, bar_h), fill=(255, 255, 255))
+    draw.rectangle((bar_w, 0, width, bar_h), fill=(0, 0, 0))
 
-    pad = 16
-    y = pad
-    draw.text((pad, y), title, font=font_title, fill=(220, 230, 240))
-    y += 28
-    draw.line((pad, y, width - pad, y), fill=(80, 90, 110), width=1)
-    y += 10
+    # Pulse a thin border on transitions so the gesture-change moment pops.
+    if transition:
+        draw.rectangle((0, bar_h, width - 1, height - 1), outline=(255, 255, 255), width=3)
 
-    label_col = pad
-    value_col = pad + 130
-
-    rows: List[Tuple[str, str]] = [
-        ("Study ID", str(raw.get("study_id", "?"))),
-        ("Age", _fmt_age(raw.get("age", ""))),
-        ("Gender", raw.get("gender", "") or "—"),
-        ("Race", raw.get("race", "") or "—"),
-        ("", ""),
-        ("— Acquisition —", ""),
-        ("Contrast", _fmt_contrast(raw.get("contrast", ""))),
-        ("Phase", _fmt_phase(raw.get("phase", ""))),
-        ("Manufacturer", raw.get("manufacturer", "") or "—"),
-        ("Model", raw.get("model", "") or "—"),
-        ("kVp", raw.get("kvp", "") or "—"),
-        ("Slice (mm)", raw.get("slice_mm", "") or "—"),
-        ("Tube (mA)", raw.get("tube_current", "") or "—"),
-    ]
-    for label, value in rows:
-        if not label and not value:
-            y += 6
-            continue
-        if label.startswith("—"):
-            draw.text((label_col, y), label, font=font_label, fill=(140, 180, 220))
-        else:
-            draw.text((label_col, y), label, font=font_label, fill=(180, 190, 200))
-            # Truncate long values
-            v = value if len(value) <= 22 else value[:21] + "…"
-            draw.text((value_col, y), v, font=font_value, fill=(240, 245, 250))
-        y += 18
-
-    # Footer
-    y_foot = height - pad - 40
-    draw.line((pad, y_foot, width - pad, y_foot), fill=(80, 90, 110), width=1)
-    draw.text(
-        (pad, y_foot + 4),
-        "Merlin  (Stanford AIMI, 2024)",
-        font=font_small,
-        fill=(140, 150, 170),
-    )
-    draw.text(
-        (pad, y_foot + 18),
-        "Abdominal CT  •  axial sweep",
-        font=font_small,
-        fill=(140, 150, 170),
-    )
-
-    if reveal:
-        # Reveal banner: amber/warm to signal organ-window highlight is on.
-        banner = (200, 120, 30)
-        text = "ORGAN OVERLAY ON  (parenchyma)"
-        bh = 30
-        draw.rectangle((0, height - bh, width, height), fill=banner)
-        draw.text((pad, height - bh + 7), text, font=font_label, fill=(250, 250, 255))
+    # Centered action text. Truncate if needed.
+    font = _load_font(max(14, int(height * 0.35)))
+    text = action.upper()
+    # Measure
+    try:
+        bbox = draw.textbbox((0, 0), text, font=font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    except Exception:
+        tw, th = font.getsize(text) if hasattr(font, "getsize") else (len(text) * 8, 14)
+    while tw > width - 20 and len(text) > 8:
+        text = text[: max(8, len(text) - 4)] + "…"
+        try:
+            bbox = draw.textbbox((0, 0), text, font=font)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        except Exception:
+            tw = len(text) * 8
+    tx = (width - tw) // 2
+    ty = bar_h + (height - bar_h - th) // 2
+    # Black drop shadow + white fill for legibility on any color.
+    draw.text((tx + 1, ty + 1), text, font=font, fill=(0, 0, 0))
+    draw.text((tx, ty), text, font=font, fill=(255, 255, 255))
 
     return np.array(img, dtype=np.uint8)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  Frame composition + video writing
-# ──────────────────────────────────────────────────────────────────────────────
-
-def compose_frame(ct_rgb: np.ndarray, panel_rgb: np.ndarray) -> np.ndarray:
-    """Concatenate CT slice and side panel side by side (same height)."""
-    h = ct_rgb.shape[0]
-    if panel_rgb.shape[0] != h:
-        pil = Image.fromarray(panel_rgb)
-        pil = pil.resize((panel_rgb.shape[1], h), Image.Resampling.LANCZOS)
-        panel_rgb = np.array(pil)
-    out = np.concatenate([ct_rgb, panel_rgb], axis=1)
+def compose_frame(banner: np.ndarray, video: np.ndarray) -> np.ndarray:
+    """Stack banner above the video frame; pad widths if mismatched."""
+    bh, bw = banner.shape[:2]
+    vh, vw = video.shape[:2]
+    if bw != vw:
+        pil = Image.fromarray(banner)
+        pil = pil.resize((vw, bh), Image.Resampling.LANCZOS)
+        banner = np.array(pil)
+    out = np.concatenate([banner, video], axis=0)
     H, W = out.shape[:2]
     if W % 2:
         out = out[:, :-1]
     if H % 2:
         out = out[:-1, :]
     return out
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Video I/O
+# ──────────────────────────────────────────────────────────────────────────────
+
+def read_video_frames(video_path: Path, max_frames: int, stride: int) -> List[np.ndarray]:
+    """Decode an mp4 to a list of RGB numpy frames via ffmpeg pipe.
+
+    Frames are taken with the given stride (1 = every frame). Up to
+    ``max_frames`` frames are kept (caps long episodes).
+    """
+    video_path = Path(video_path)
+    if not video_path.exists():
+        return []
+    # Probe video size with ffprobe.
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height", "-of", "csv=p=0:s=,",
+             str(video_path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        wh = out.stdout.strip().split(",")
+        w, h = int(wh[0]), int(wh[1])
+    except Exception:
+        return []
+
+    frame_size = w * h * 3
+    cmd = [
+        "ffmpeg", "-loglevel", "error", "-i", str(video_path),
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    frames: List[np.ndarray] = []
+    idx = 0
+    try:
+        while True:
+            buf = proc.stdout.read(frame_size)
+            if not buf or len(buf) < frame_size:
+                break
+            if idx % stride == 0:
+                arr = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 3).copy()
+                frames.append(arr)
+                if len(frames) >= max_frames:
+                    break
+            idx += 1
+    finally:
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+        proc.wait()
+    return frames
 
 
 def write_mp4(frames: List[np.ndarray], out_path: Path, fps: int) -> None:
@@ -300,10 +262,3 @@ def write_mp4(frames: List[np.ndarray], out_path: Path, fps: int) -> None:
     finally:
         p.stdin.close()
         p.wait()
-
-
-def resize_square(rgb: np.ndarray, size: int) -> np.ndarray:
-    """Resize an RGB frame to size x size via PIL LANCZOS."""
-    pil = Image.fromarray(rgb)
-    pil = pil.resize((size, size), Image.Resampling.LANCZOS)
-    return np.array(pil)
