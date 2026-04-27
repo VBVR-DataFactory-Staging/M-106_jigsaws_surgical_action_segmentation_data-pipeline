@@ -1,21 +1,25 @@
-"""Pipeline configuration for M-106 Merlin abdominal-CT findings dataset.
+"""Pipeline configuration for M-106 JIGSAWS surgical action segmentation.
 
-Merlin (Stanford AIMI) is a foundation-model-grade abdominal CT dataset:
-    - CT volumes:    s3://med-vr-datasets/M-106/merlin_ct/merlinabdominalctdataset/merlin_data/<study_id>.nii.gz
-    - Metadata CSV:  s3://.../merlinabdominalctdataset/metadata.csv
-        columns: study id, Age, Gender, Race, contrast, manufacturer,
-                 manufacturermodelname, kvp, slicethickness, xraytubecurrent, phase
+Source layout in s3://med-vr-datasets/M-106/JIGSAWS/ (LeRobot v2.0 format,
+mirrored from huggingface.co/datasets/Potestates/jigsaws-lerobot)::
 
-We adapt M-100 INSPECT (sister Stanford CT pipeline). For each study we render:
-    first_video        = clean axial sweep through abdominal organs
-    last_video         = annotated sweep with HU-based organ-window highlight
-                         + reveal banner showing study metadata
-    ground_truth_video = same as last_video
+    JIGSAWS/
+      meta/
+        info.json
+        tasks.jsonl                # task_index -> action label
+        episodes.jsonl             # per-episode task list + length
+      data/chunk-000/
+        episode_000000.parquet     # per-frame: annotation.language.language_instruction
+        episode_000001.parquet
+        ...
+      videos/chunk-000/video.exterior_image_1_left/
+        episode_000000.mp4         # robotic surgery RGB video (30 fps)
+        episode_000001.mp4
+        ...
 
-NOTE: GitHub repo name remains
-``M-106_jigsaws_surgical_action_segmentation_data-pipeline`` (the website maps
-by repo prefix, so we do not rename), but the actual ``domain`` (used for the
-on-disk task folder name) is ``merlin_abdominal_ct_findings``.
+Each episode = one task sample. The pipeline overlays a per-frame action-label
+banner (color-coded by action) onto the surgical video so transitions between
+gestures (G1..G15-like steps) are visually obvious.
 """
 from pathlib import Path
 
@@ -25,34 +29,25 @@ from core.pipeline import PipelineConfig
 
 
 class TaskConfig(PipelineConfig):
-    """Dataset + rendering settings for Merlin abdominal CT pipeline."""
+    """Settings for the JIGSAWS surgical action-segmentation pipeline."""
 
-    domain: str = Field(default="merlin_abdominal_ct_findings")
+    domain: str = Field(default="jigsaws_surgical_action_segmentation")
 
-    # Empty generator name → flat layout under data/questions/<domain>_task/<task_id>/
+    # Empty generator name -> flat layout under data/questions/<domain>_task/.
     generator: str = Field(default="")
 
-    # Source layout in s3://med-vr-datasets/M-106/
+    # Source layout in s3://med-vr-datasets/M-106/JIGSAWS/ (mirror of HF dataset).
     s3_bucket: str = Field(default="med-vr-datasets")
-    s3_prefix: str = Field(
-        default="M-106/merlin_ct/merlinabdominalctdataset/"
-    )
+    s3_prefix: str = Field(default="M-106/JIGSAWS/")
     raw_dir: Path = Field(default=Path("raw"))
 
-    # Abdominal soft-tissue window centred on liver/parenchyma (~+50, ±200 HU).
-    window_level: int = Field(default=50)
-    window_width: int = Field(default=400)
+    # Video layout: render at native frame size, then resize to a stable
+    # square so the website can display consistently.
+    fps: int = Field(default=10)              # downsample from 30 fps source
+    frame_size: int = Field(default=480)      # output square size
+    banner_height: int = Field(default=60)    # action banner above video
+    max_frames: int = Field(default=240)      # cap per-episode frames (24s @ 10fps)
 
-    # Video: axial sweep through the central abdomen (organs).
-    fps: int = Field(default=8)
-    num_frames: int = Field(default=28)
-
-    # Frame output size.
-    frame_height: int = Field(default=512)
-    ehr_panel_width: int = Field(default=360)
-
-    # Organ highlight (warm tint, 35% opacity) on annotated video.
-    pe_alpha: float = Field(default=0.35)
-
-    # Default cap (overridden by --num-samples on the CLI).
+    # Optional per-episode index offset and cap.
+    start_index: int = Field(default=0)
     max_samples: int = Field(default=300, ge=1)
