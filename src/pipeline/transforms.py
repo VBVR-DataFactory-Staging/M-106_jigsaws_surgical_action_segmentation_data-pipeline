@@ -209,7 +209,8 @@ def read_video_frames(video_path: Path, max_frames: int, stride: int) -> List[np
         "ffmpeg", "-loglevel", "error", "-i", str(video_path),
         "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
     ]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL)
     frames: List[np.ndarray] = []
     idx = 0
     try:
